@@ -1,0 +1,12 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docsqz"
+version = "0.1.0"
+description = "Document processing pipeline (PDF flattening, extraction, DOCX conversion/extraction)."
+authors = [
+  {name = "John-John", email = "your@email.com"},
+]
+dependencies = ["pymupdf", "pillow", "numpy", "pandas", "layoutparser", "paddleocr", "python-docx", "pypandoc"]
