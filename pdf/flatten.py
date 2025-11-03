@@ -1,31 +1,32 @@
+"""
+PDF flattening utilities for docsqz.
+
+Includes:
+- Acrobat macOS flattening via keyboard automation + spool watching
+- Aspose Cloud flattening (XFA → AcroForm → flatten → download)
+"""
+
 from __future__ import annotations
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 import os
-from ..config import PRINTER, SPOOL_DIR, ASPOSE_CLIENT_ID, ASPOSE_CLIENT_SECRET, PDF_TIMEOUT_SECS
+import os.path as op
+import time
+import subprocess
 
-## XFA Flatten via Acrobat (macOS, PDFwriter)
+# ==============================================================
+# Config: prefer DOCSQZ.config, else fall back to safe defaults
+# ==============================================================
 
-# Requirements:
-# - macOS
-# - Adobe Acrobat/Reader installed
-# - "PDFwriter" virtual printer installed
-# - Terminal/osascript has Accessibility permission (System Settings → Privacy & Security → Accessibility)
+# Fallbacks = your original working values
+_FALLBACK = {
+    "PRINTER":       os.getenv("DOCSQZ_PRINTER", "PDFwriter"),
+    "SPOOL_DIR":     Path(os.getenv("DOCSQZ_SPOOL_DIR", "/private/var/spool/pdfwriter/vahedi")),
+    "SPOOL_TIMEOUT": int(os.getenv("DOCSQZ_SPOOL_TIMEOUT", "15")),
+    "UI_DEADLINE":   float(os.getenv("DOCSQZ_UI_DEADLINE", "5.0")),
+}
 
-# --- Standard Library ---
-import os, time, subprocess
-from pathlib import Path
-from typing import Tuple, Dict, List, Optional
-
-# --- Config (overrides via env if you like) ---
-PRINTER       = os.getenv("DOCSQZ_PRINTER", "PDFwriter")
-SPOOL_DIR     = Path(os.getenv("DOCSQZ_SPOOL_DIR", "/private/var/spool/pdfwriter/vahedi"))
-SPOOL_TIMEOUT = int(os.getenv("DOCSQZ_SPOOL_TIMEOUT", "15"))    # seconds to wait for spool file
-UI_DEADLINE   = float(os.getenv("DOCSQZ_UI_DEADLINE", "5.0"))   # seconds to wait for print dialog to vanish
-
-# --- Profile Timings ---
-# FAST  = your production floor baseline
-# TURBO = most aggressive (default, tried first)
-# SAFE  = cushioned / fallback
+# Original profile timings
 FAST = dict(d_after_open=0.82, d_after_cmdp=0.45, d_before_space=0.03,
             d_after_space=0.08, d_after_type=0.14, d_between_returns=0.10,
             tabs_to_printer=0)
@@ -38,10 +39,32 @@ SAFE = dict(d_after_open=0.90, d_after_cmdp=1.20, d_before_space=0.05,
             d_after_space=0.30, d_after_type=0.22, d_between_returns=0.30,
             tabs_to_printer=0)
 
-# Order for auto mode: TURBO → FAST → SAFE
-PROFILE_ORDER: List[Tuple[str, Dict[str, float]]] = [("turbo", TURBO), ("fast", FAST), ("safe", SAFE)]
+_DEFAULT_PROFILE_ORDER: List[Tuple[str, Dict[str, float]]] = [("turbo", TURBO), ("fast", FAST), ("safe", SAFE)]
 
-# --- Acrobat/Reader labels to try ---
+# Try to import project config (case-sensitive). If missing, use fallbacks.
+try:
+    from DOCSQZ.config import (  # type: ignore
+        PRINTER, SPOOL_DIR, PROFILE_ORDER,
+        SPOOL_TIMEOUT, UI_DEADLINE,
+        ASPOSE_BASE, ASPOSE_CLIENT_ID, ASPOSE_CLIENT_SECRET, ASPOSE_STORAGE_NAME,
+    )
+except Exception:
+    PRINTER       = _FALLBACK["PRINTER"]
+    SPOOL_DIR     = _FALLBACK["SPOOL_DIR"]
+    SPOOL_TIMEOUT = _FALLBACK["SPOOL_TIMEOUT"]
+    UI_DEADLINE   = _FALLBACK["UI_DEADLINE"]
+    PROFILE_ORDER = _DEFAULT_PROFILE_ORDER
+    # Aspose fallbacks (these must be set via env or passed in)
+    ASPOSE_BASE           = os.getenv("ASPOSE_BASE", "https://api.aspose.cloud")
+    ASPOSE_CLIENT_ID      = os.getenv("ASPOSE_CLIENT_ID", "")
+    ASPOSE_CLIENT_SECRET  = os.getenv("ASPOSE_CLIENT_SECRET", "")
+    ASPOSE_STORAGE_NAME   = os.getenv("ASPOSE_STORAGE_NAME", None)
+
+# ======================================================================
+# --- Acrobat macOS flattening path (keyboard automation + spool watch)
+# ======================================================================
+
+# Acrobat/Reader labels to try
 APP_LABEL_CANDIDATES = [
     "Adobe Acrobat", "Adobe Acrobat DC",
     "Adobe Acrobat Reader DC", "Adobe Acrobat Reader",
@@ -70,7 +93,7 @@ def printer_available(printer_name: str) -> bool:
 
 def detect_acrobat_app_and_process() -> Tuple[str, str, str]:
     """Return (app_label, bundle_id, ui_process_name) for Acrobat/Reader."""
-    app_label = bundle_id = None
+    app_label = bundle_id = None  # type: ignore[assignment]
     for label in APP_LABEL_CANDIDATES:
         rc, out, _ = _osascript([f'id of application "{label}"'])
         if rc == 0 and out:
@@ -117,6 +140,7 @@ def wait_for_output(spool_dir: Path, before_names: set, timeout_s: int) -> Optio
 
 # --- Guards / watchdog ---
 def is_print_dialog_open(ui_process: str) -> bool:
+    """Restore the original, reliable detection (sheet OR window has a Print button)."""
     rc, out, _ = _osascript([
         'tell application "System Events"',
         f'  tell application process "{ui_process}"',
@@ -136,6 +160,29 @@ def is_print_dialog_open(ui_process: str) -> bool:
         return False
     s_sheet, s_win = out.split(",")
     return (s_sheet == "true") or (s_win == "true")
+
+def accept_save_panel_if_present(ui_process: str) -> bool:
+    rc, out, _ = _osascript([
+        'tell application "System Events"',
+        f'  tell application process "{ui_process}"',
+        '    set hasSave to false',
+        '    try',
+        '      if exists sheet 1 of window 1 then',
+        '        try',
+        '          if exists text field 1 of sheet 1 of window 1 then set hasSave to true',
+        '        end try',
+        '      end if',
+        '    end try',
+        '    if hasSave then',
+        '      try',
+        '        key code 36 -- Return',
+        '      end try',
+        '    end if',
+        '    return hasSave as string',
+        '  end tell',
+        'end tell',
+    ])
+    return (rc == 0 and out == "true")
 
 def dismiss_print_dialog(ui_process: str) -> bool:
     _osascript([
@@ -178,7 +225,7 @@ def hard_reset_acrobat(app_label: str, ui_process: str, wait_s: float = 4.0) -> 
     ])
     return (rc == 0 and out == "false")
 
-# --- Keyboard print flow ---
+# --- Keyboard flow ---
 def print_keyboard_once(
     ui_process: str,
     printer_name: str,
@@ -229,16 +276,31 @@ def run_trial_guarded(
     spool_dir: Path,
     timeouts: Dict[str, float],
     delays: Dict[str, float],
-    dry_run: bool=False,
-    allow_hard_reset: bool=True
+    dry_run: bool = False,
+    allow_hard_reset: bool = True,
+    close_app_after: bool = False,          # <— NEW
 ) -> Dict[str, object]:
+
+    t0 = time.time()
+
+    def _ok(phase: str, **kw):
+        d = {"ok": True, "phase": phase, "elapsed": time.time() - t0, "err": ""}
+        d.update(kw); return d
+
+    def _fail(phase: str, msg: str, **kw):
+        d = {"ok": False, "phase": phase, "elapsed": time.time() - t0, "err": msg}
+        d.update(kw); return d
+
+    # ----- Prechecks
     spool_timeout = int(timeouts.get("spool_timeout", SPOOL_TIMEOUT))
     ui_deadline_s = float(timeouts.get("ui_deadline", UI_DEADLINE))
 
+    if not pdf.exists():
+        return _fail("precheck", f"PDF not found: {pdf}")
     if not printer_available(printer):
-        return {"ok": False, "phase": "precheck", "err": f'Printer "{printer}" not found'}
+        return _fail("precheck", f'Printer "{printer}" not found')
     if not spool_dir.exists():
-        return {"ok": False, "phase": "precheck", "err": f'Spool dir missing: {spool_dir}'}
+        return _fail("precheck", f"Spool dir missing: {spool_dir}")
 
     app_label, _, ui_proc = detect_acrobat_app_and_process()
 
@@ -255,11 +317,11 @@ def run_trial_guarded(
         f'delay {max(delays.get("d_after_open", 0.8), 0):.2f}',
     ])
     if rc != 0:
-        return {"ok": False, "phase": "open", "err": err}
+        return _fail("open", err or "failed to open PDF in Acrobat")
 
     before = set(os.listdir(spool_dir)) if spool_dir.exists() else set()
-    t0 = time.time()
 
+    # Print via keyboard
     rc, _, err = print_keyboard_once(
         ui_process=ui_proc,
         printer_name=printer,
@@ -270,42 +332,56 @@ def run_trial_guarded(
         d_after_type=delays.get("d_after_type", 0.2),
         d_between_returns=delays.get("d_between_returns", 0.2),
         tabs_to_printer=delays.get("tabs_to_printer", 0),
-        dry_run=dry_run
+        dry_run=dry_run,
     )
     if rc != 0:
-        dismiss_print_dialog(ui_proc)
-        close_front_document(app_label)
+        try: dismiss_print_dialog(ui_proc)
+        except: pass
+        try: close_front_document(app_label)
+        except: pass
         if allow_hard_reset:
-            hard_reset_acrobat(app_label, ui_proc)
-        return {"ok": False, "phase": "ui", "err": err}
+            try: hard_reset_acrobat(app_label, ui_proc)
+            except: pass
+        return _fail("ui", err or "keyboard print failed")
 
-    # Watchdog
-    while time.time() - t0 < ui_deadline_s:
+    # Dry run: exit early
+    if dry_run:
+        try: close_front_document(app_label)
+        except: pass
+        return _ok("dry_run")
+
+    # Watchdog: wait for print dialog to close (up to ui_deadline), then spool (up to spool_timeout)
+    t_ui_deadline = time.time() + ui_deadline_s
+    while time.time() < t_ui_deadline:
+        try:
+            accept_save_panel_if_present(ui_proc)
+        except:
+            pass
         if not is_print_dialog_open(ui_proc):
             break
         time.sleep(0.2)
     else:
+        # UI never closed
         dismiss_print_dialog(ui_proc)
         close_front_document(app_label)
         if allow_hard_reset:
             hard_reset_acrobat(app_label, ui_proc)
-        return {"ok": False, "phase": "ui_watchdog", "err": "print dialog did not close in time"}
+        return _fail("ui_watchdog", "print dialog did not close in time")
 
-    if dry_run:
-        close_front_document(app_label)
-        return {"ok": True, "phase": "dry_run", "elapsed": time.time() - t0}
-
+    # Spool wait (original behavior)
     out_path = wait_for_output(spool_dir, before, timeout_s=spool_timeout)
-    elapsed = time.time() - t0
-    close_front_document(app_label)
-
     if not out_path:
         dismiss_print_dialog(ui_proc)
         if allow_hard_reset:
             hard_reset_acrobat(app_label, ui_proc)
-        return {"ok": False, "phase": "spool_wait", "elapsed": elapsed, "err": "timeout waiting for spool"}
+        close_front_document(app_label)
+        return _fail("spool_wait", f"timeout waiting for spool ({spool_dir})")
 
-    return {"ok": True, "phase": "done", "elapsed": elapsed, "spooled": str(out_path)}
+    close_front_document(app_label)
+    if close_app_after:                      # <— NEW
+        _osascript([f'tell application "{app_label}" to quit'])
+        _osascript(['delay 0.2'])
+    return _ok("done", spooled=str(out_path))
 
 # --- Public wrappers ---
 def flatten_one_auto(
@@ -313,7 +389,9 @@ def flatten_one_auto(
     profiles: List[Tuple[str, Dict[str, float]]] = PROFILE_ORDER,
     spool_timeout: int = SPOOL_TIMEOUT,
     ui_deadline: float = UI_DEADLINE,
-    hard_reset: bool = True
+    hard_reset: bool = True,
+    close_app_after: bool = False,
+    verbose = False,# <— NEW
 ) -> Dict[str, object]:
     """Try profiles in order (TURBO → FAST → SAFE). Rename output to *_flattened.pdf."""
     pdf = Path(pdf).expanduser().resolve(strict=True)
@@ -325,10 +403,14 @@ def flatten_one_auto(
             timeouts={"spool_timeout": spool_timeout, "ui_deadline": ui_deadline},
             delays=delays,
             dry_run=False,
-            allow_hard_reset=hard_reset
+            allow_hard_reset=hard_reset,
+            close_app_after=close_app_after, # <— NEW
         )
-        print(f"[{name}] ok={res['ok']} phase={res.get('phase')} "
-              f"elapsed={round(res.get('elapsed',0),2)} err={res.get('err','')}")
+        if not verbose:
+                print('PDF flattened')
+        else:
+            print(f"[{name}] ok={res['ok']} phase={res.get('phase')} "
+                  f"elapsed={round(res.get('elapsed',0),2)} err={res.get('err','')}")
         if res["ok"]:
             sp = Path(res["spooled"])
             target = pdf.with_name(pdf.stem + "_flattened.pdf")
@@ -339,112 +421,157 @@ def flatten_one_auto(
                 try: sp.unlink()
                 except: pass
             res["output"] = str(target)
-            print(f"[✓] -> {target}")
+            if verbose:
+                print(f"[✓] -> {target}")
             return res
     raise RuntimeError("All profiles failed (keyboard path). Consider click-based fallback if needed.")
 
-def flatten_auto(
-    path: str | Path,
-    profiles: List[Tuple[str, Dict[str, float]]] = PROFILE_ORDER,
-    recursive: bool = False
-) -> List[Dict[str, object]] | Dict[str, object]:
-    """If path is a file: flatten once; if folder: flatten all PDFs (optionally recursive)."""
-    p = Path(path).expanduser().resolve()
-    if not p.exists():
-        raise FileNotFoundError(f"Path not found: {p}")
-    if p.is_file() and p.suffix.lower() == ".pdf":
-        print(f"[file] {p.name}")
-        return flatten_one_auto(p, profiles=profiles)
-    if p.is_dir():
-        print(f"[folder] {p} (recursive={recursive})")
-        it = p.rglob("*.pdf") if recursive else p.glob("*.pdf")
-        results = []
-        for q in sorted(it):
-            try:
-                results.append(flatten_one_auto(q, profiles=profiles))
-            except Exception as e:
-                print(f"[x] {q.name}: {e}")
-        print(f"[done] processed {len(results)} PDFs")
-        return results
-    raise ValueError(f"Path is a file but not a .pdf: {p}")
+# ======================================================================
+# --- Aspose Cloud flattening path
+# ======================================================================
 
-## Project Name Moniker
-proj_mnkr = "Auto_Rate"
-
-## Config (paths, constants)
-from pathlib import Path
-import os
-
-DATA_DIR = Path("../../Data/")
-OUT_DIR  = Path(f"../../Output/{proj_mnkr}/")
-OUT_DIR.mkdir(parents=True, exist_ok=True)
-
-DOC_PATH = Path("Documents/IJ_Risk_Evaluation_Approach.docx")
-PDF_PATH = Path("Documents/Educational_FY2023_NSGP_S_VA_Highland School Educational Foundation_IJ.pdf")
-
-DPI = 240  # for PDF rendering/OCR/etc.
-FLATTEN_SUFFIX = "_flattened"  # output filename suffix before .pdf
-
-## Credentials (env-first with literal fallbacks)
-ADOBE_CLIENT_ID     = os.getenv("ADOBE_CLIENT_ID",     "c2d7bbc5bea04542b50cc6c54bb44b45")
-ADOBE_CLIENT_SECRET = os.getenv("ADOBE_CLIENT_SECRET", "p8e-LZ1gF1r8CNl7MHgqQ1r6CiqY1B0em1uO")
-
-ASPOSE_BASE          = os.getenv("ASPOSE_BASE",          "https://api.aspose.cloud")
-ASPOSE_CLIENT_ID     = os.getenv("ASPOSE_CLIENT_ID",     "42a849c0-13d4-4ab3-ad82-b7d9099cbc22")
-ASPOSE_CLIENT_SECRET = os.getenv("ASPOSE_CLIENT_SECRET", "12cefab4412f32e62bb528a1b7ced607")
-ASPOSE_STORAGE_NAME  = os.getenv("ASPOSE_STORAGE_NAME",  "Data")
-
-## Flatten via Acrobat (macOS, PDFwriter)
-PRINTER       = os.getenv("DOCSQZ_PRINTER", "PDFwriter")
-SPOOL_DIR     = Path(os.getenv("DOCSQZ_SPOOL_DIR", "/private/var/spool/pdfwriter/vahedi"))
-
-SPOOL_TIMEOUT = int(os.getenv("DOCSQZ_SPOOL_TIMEOUT", "15"))   # seconds to wait for spool file
-UI_DEADLINE   = float(os.getenv("DOCSQZ_UI_DEADLINE", "5.0"))  # seconds to wait for print dialog to vanish
-
-# Profile timings (TURBO default/first)
-FAST  = dict(d_after_open=0.82, d_after_cmdp=0.45, d_before_space=0.03,
-             d_after_space=0.08, d_after_type=0.14, d_between_returns=0.10,
-             tabs_to_printer=0)
-
-TURBO = dict(d_after_open=0.05, d_after_cmdp=0.05, d_before_space=0.02,
-             d_after_space=0.03, d_after_type=0.05, d_between_returns=0.04,
-             tabs_to_printer=0)
-
-SAFE  = dict(d_after_open=0.90, d_after_cmdp=1.20, d_before_space=0.05,
-             d_after_space=0.30, d_after_type=0.22, d_between_returns=0.30,
-             tabs_to_printer=0)
-
-PROFILE_ORDER = [("turbo", TURBO), ("fast", FAST), ("safe", SAFE)]
-
-print("Config loaded.")
-
-
-def flatten_acrobat_macos(input_pdf, *args, **kwargs) -> Path:
+def aspose_get_token(
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+    base: str = ASPOSE_BASE,
+    timeout: int = 120,
+) -> str:
     """
-    Wrapper around the 'Acrobat MacOS Flatten' notebook code.
-    Must respect PRINTER, SPOOL_DIR, PDF_TIMEOUT_SECS.
-    Returns Path to '..._flattened.pdf'.
+    Fetch OAuth token from Aspose Cloud.
+    You must supply client_id/secret (or set env/ASPOSE_*).
     """
-    in_path = Path(input_pdf)
-    out_path = in_path.with_name(in_path.stem + "_flattened.pdf")
-    # Try to find an implementation in globals
-    for fname in ("flatten_acrobat", "acrobat_flatten", "macos_flatten"):
-        if fname in globals() and callable(globals()[fname]):
-            return Path(globals()[fname](str(in_path), *args, **kwargs))
-    # Fallback: assume external spooler logic handled in copied code.
-    return out_path
+    import requests
+    cid = (client_id or ASPOSE_CLIENT_ID or "").strip()
+    csec = (client_secret or ASPOSE_CLIENT_SECRET or "").strip()
+    if not cid or not csec:
+        raise RuntimeError("Aspose credentials missing (client_id/client_secret).")
+    r = requests.post(
+        f"{base}/connect/token",
+        data={
+            "grant_type": "client_credentials",
+            "client_id": cid,
+            "client_secret": csec,
+        },
+        headers={"Content-Type": "application/x-www-form-urlencoded", "Accept": "application/json"},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    return r.json()["access_token"]
 
-def flatten_aspose(input_pdf, client_id=None, client_secret=None, *args, **kwargs) -> Path:
+def aspose_upload_file(local_path: str, remote_path: str,
+                       storage_name: Optional[str] = None,
+                       token: Optional[str] = None,
+                       base: str = ASPOSE_BASE,
+                       timeout: int = 300) -> None:
+    import requests
+    storage = storage_name or ASPOSE_STORAGE_NAME
+    tok = token or aspose_get_token()
+    with open(local_path, "rb") as f:
+        r = requests.put(
+            f"{base}/v3.0/pdf/storage/file/{remote_path}",
+            headers={"Authorization": f"Bearer {tok}"},
+            params={"storageName": storage},
+            data=f,
+            timeout=timeout,
+        )
+    r.raise_for_status()
+
+def aspose_convert_xfa_to_acroform(input_remote_path: str, out_remote_path: str,
+                                   storage_name: Optional[str] = None,
+                                   token: Optional[str] = None,
+                                   base: str = ASPOSE_BASE,
+                                   timeout: int = 600) -> None:
+    import requests
+    storage = storage_name or ASPOSE_STORAGE_NAME
+    tok = token or aspose_get_token()
+    name_in  = op.basename(input_remote_path)
+    folder_in = op.dirname(input_remote_path)
+    r = requests.put(
+        f"{base}/v3.0/pdf/{name_in}/convert/xfatoacroform",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"folder": folder_in, "outPath": out_remote_path, "storageName": storage},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+
+def aspose_flatten_in_place(remote_path: str,
+                            storage_name: Optional[str] = None,
+                            token: Optional[str] = None,
+                            base: str = ASPOSE_BASE,
+                            timeout: int = 600) -> None:
+    import requests
+    storage = storage_name or ASPOSE_STORAGE_NAME
+    tok = token or aspose_get_token()
+    name_conv   = op.basename(remote_path)
+    folder_conv = op.dirname(remote_path)
+    r = requests.put(
+        f"{base}/v3.0/pdf/{name_conv}/fields/flatten",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"folder": folder_conv, "storageName": storage},
+        timeout=timeout,
+    )
+    r.raise_for_status()
+
+def aspose_download_file(remote_path: str, local_out: str,
+                         storage_name: Optional[str] = None,
+                         token: Optional[str] = None,
+                         base: str = ASPOSE_BASE,
+                         timeout: int = 600) -> str:
+    import requests
+    storage = storage_name or ASPOSE_STORAGE_NAME
+    tok = token or aspose_get_token()
+    r = requests.get(
+        f"{base}/v3.0/pdf/storage/file/{remote_path}",
+        headers={"Authorization": f"Bearer {tok}"},
+        params={"storageName": storage},
+        stream=True, timeout=timeout,
+    )
+    r.raise_for_status()
+    os.makedirs(op.dirname(local_out) or ".", exist_ok=True)
+    with open(local_out, "wb") as out:
+        for chunk in r.iter_content(1 << 20):
+            out.write(chunk)
+    return local_out
+
+def flatten_xfa_pdf_with_aspose(
+    local_in: str,
+    in_remote: str = "incoming/input.pdf",
+    out_remote: str = "converted/xfa_to_acroform.pdf",
+    local_out: str = "your_xfa_flattened.pdf",
+    storage_name: Optional[str] = None,
+    client_id: Optional[str] = None,
+    client_secret: Optional[str] = None,
+) -> str:
     """
-    Wrapper around the 'Aspose Flatten' notebook code.
-    Must respect ASPOSE_CLIENT_ID/SECRET env or explicit args.
-    Returns Path to '..._flattened.pdf'.
+    End-to-end: upload -> XFA->AcroForm -> flatten in place -> download.
+    Returns local_out path.
     """
-    in_path = Path(input_pdf)
-    out_path = in_path.with_name(in_path.stem + "_flattened.pdf")
-    cid = client_id or ASPOSE_CLIENT_ID
-    csec = client_secret or ASPOSE_CLIENT_SECRET
-    for fname in ("flatten_aspose", "aspose_flatten", "flatten_with_aspose"):
-        if fname in globals() and callable(globals()[fname]):
-            return Path(globals()[fname](str(in_path), cid, csec, *args, **kwargs))
+    tok = aspose_get_token(client_id=client_id, client_secret=client_secret)
+    aspose_upload_file(local_in, in_remote, storage_name=storage_name, token=tok)
+    aspose_convert_xfa_to_acroform(in_remote, out_remote, storage_name=storage_name, token=tok)
+    aspose_flatten_in_place(out_remote, storage_name=storage_name, token=tok)
+    return aspose_download_file(out_remote, local_out, storage_name=storage_name, token=tok)
+
+# ======================================================================
+# --- Public wrappers for package API
+# ======================================================================
+def flatten_acrobat_macos(pdf_path: str | Path, close_app_after: bool = False) -> Path:
+    """
+    Public wrapper: flatten using Acrobat macOS (keyboard automation).
+    Returns Path to the flattened PDF.
+    """
+    res = flatten_one_auto(pdf_path, close_app_after=close_app_after)
+    return Path(res["output"])
+
+def flatten_aspose(pdf_path: str | Path,
+                   client_id: Optional[str] = None,
+                   client_secret: Optional[str] = None) -> Path:
+    """
+    Public wrapper: flatten using Aspose Cloud.
+    Returns Path to the flattened PDF.
+    """
+    pdf_path = Path(pdf_path).expanduser().resolve()
+    out_path = pdf_path.with_name(pdf_path.stem + "_flattened.pdf")
+    flatten_xfa_pdf_with_aspose(str(pdf_path), local_out=str(out_path),
+                                client_id=client_id, client_secret=client_secret)
     return out_path
